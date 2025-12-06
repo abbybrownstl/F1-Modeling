@@ -1,0 +1,201 @@
+---
+title: "F1 Modeling - Initial EDA"
+author: "Abby Brown"
+output: html_document
+date: "2025-10-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Data and library loading: Data is loaded from the OpenF1 API.
+```{r}
+# ==========================================================
+# OpenF1 Grand Prix EDA (2022–2024) with Rate-Limit Handling
+# ==========================================================
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(purrr)
+library(tidyr)
+library(lubridate)
+
+# ---- Setup ----
+if (!dir.exists("data")) dir.create("data")
+if (!dir.exists("plots")) dir.create("plots")
+
+# ---- User Option: Include Sprint Races ----
+include_sprints <- FALSE  # Change to TRUE to include sprint sessions
+
+# ---- Orange-based color palette ----
+orange_pal <- colorRampPalette(c("#7C2D12", "#C2410C", "#F97316", "#FDBA74", "#FFEDD5"))(30)
+
+theme_orange <- function() {
+  theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(color = "#E65100", face = "bold", hjust = 0.5),
+      axis.title = element_text(color = "#E65100"),
+      axis.text = element_text(color = "#5D4037"),
+      panel.grid.minor = element_blank(),
+      legend.title = element_text(color = "#C2410C"),
+      legend.text = element_text(color = "#7C2D12"),
+      legend.position = "bottom"
+    )
+}
+
+# ---- Robust API Fetch with Rate-Limit Handling ----
+fetch_openf1 <- function(endpoint, query = list(), retries = 5, delay = 5) {
+  base_url <- paste0("https://api.openf1.org/v1/", endpoint)
+  
+  for (i in seq_len(retries)) {
+    res <- GET(base_url, query = query)
+    status <- status_code(res)
+    
+    if (status == 200) {
+      data <- fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+      if (is.data.frame(data)) return(data)
+      tryCatch({
+        df <- do.call(rbind, lapply(data, as.data.frame, stringsAsFactors = FALSE))
+        return(df)
+      }, error = function(e) data.frame())
+    } else if (status == 429) {
+      message(paste0("⏳ Rate limit hit. Waiting ", delay, " seconds before retry..."))
+      Sys.sleep(delay)
+      delay <- delay * 2  # exponential backoff
+    } else if (status == 400) {
+      stop("Bad Request (HTTP 400): Check endpoint or query parameters.")
+    } else if (status == 401) {
+      stop("Unauthorized (HTTP 401): Check your base URL (should be https://api.openf1.org/v1/).")
+    } else {
+      stop_for_status(res)
+    }
+  }
+  
+  warning(paste("Failed to fetch:", endpoint))
+  return(data.frame())
+}
+
+# ---- Connection Check ----
+cat("Checking API connection...\n")
+test_res <- try(fetch_openf1("meetings", query = list(year = 2024)), silent = TRUE)
+if (inherits(test_res, "try-error")) stop("❌ API connection failed. Check internet or endpoint URL.")
+cat("✅ Connection successful!\n")
+
+# ---- Parameters ----
+years <- 2022:2024
+
+# ---- Fetch Meeting Data ----
+cat("Fetching meetings data...\n")
+meetings_cache <- "data/meetings_2022_2024.rds"
+if (file.exists(meetings_cache)) {
+  meetings <- readRDS(meetings_cache)
+} else {
+  meetings <- map_dfr(years, function(yr) {
+    Sys.sleep(1)  # small delay to avoid rate-limit
+    fetch_openf1("meetings", query = list(year = yr))
+  })
+  saveRDS(meetings, meetings_cache)
+}
+
+meetings <- meetings %>%
+  select(meeting_key, year, circuit_short_name, location, country_name, date_start, meeting_name) %>%
+  mutate(
+    date_start = suppressWarnings(ymd(date_start, quiet = TRUE)),
+    year = as.integer(year)
+  )
+
+# ---- Fetch Sessions ----
+cat("Fetching session data...\n")
+sessions_cache <- "data/sessions_2022_2024.rds"
+if (file.exists(sessions_cache)) {
+  sessions <- readRDS(sessions_cache)
+} else {
+  sessions <- map_dfr(meetings$meeting_key, function(key) {
+    Sys.sleep(1)  # small delay to avoid rate-limit
+    fetch_openf1("sessions", query = list(meeting_key = key))
+  })
+  saveRDS(sessions, sessions_cache)
+}
+
+# ---- Filter Only Race Sessions ----
+race_sessions <- sessions %>%
+  filter(
+    tolower(session_name) == "race" |
+    tolower(session_type) == "race" |
+    (include_sprints & grepl("sprint", tolower(session_name)))
+  )
+
+# Remove testing, practice, qualifying
+race_sessions <- race_sessions %>%
+  filter(!grepl("test|practice|qualifying", tolower(session_name)))
+
+# ---- Join Race Sessions with Meetings ----
+race_meetings <- meetings %>%
+  semi_join(race_sessions, by = "meeting_key")
+
+# ---- Fetch Lap Data for Sample Sessions ----
+lap_cache <- "data/lap_data_sample.rds"
+if (file.exists(lap_cache)) {
+  laps <- readRDS(lap_cache)
+} else {
+  set.seed(123)
+  sample_sessions <- sample(unique(race_sessions$session_key), size = min(3, nrow(race_sessions)))
+  laps <- map_dfr(sample_sessions, function(skey) {
+    Sys.sleep(1)
+    fetch_openf1("laps", query = list(session_key = skey))
+  })
+  saveRDS(laps, lap_cache)
+}
+
+# ---- Summarize Lap Data ----
+lap_summary <- laps %>%
+  group_by(session_key, driver_number) %>%
+  summarise(
+    avg_lap_time = mean(lap_duration, na.rm = TRUE),
+    fastest_lap = min(lap_duration, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Plot 1: Average Lap Time by Session ----
+ggplot(lap_summary, aes(x = as.factor(session_key),
+                        y = avg_lap_time,
+                        color = as.factor(driver_number))) +
+  geom_point(alpha = 0.8, size = 3) +
+  scale_color_manual(values = orange_pal, name = "Driver #") +
+  labs(title = "Average Lap Time by Race Session",
+       x = "Session Key",
+       y = "Average Lap Time (s)") +
+  theme_orange()
+ggsave("plots/lap_time_by_session.png", width = 10, height = 6, dpi = 300)
+
+# ---- Plot 2: Number of Official Races per Year ----
+races_per_year <- race_meetings %>%
+  count(year)
+
+ggplot(races_per_year, aes(x = factor(year), y = n, fill = factor(year))) +
+  geom_col() +
+  scale_fill_manual(values = orange_pal[1:3]) +
+  labs(title = paste0("Number of Official Grands Prix per Year (2022–2024)",
+                      ifelse(include_sprints, " (Including Sprints)", "")),
+       x = "Year",
+       y = "Race Count") +
+  theme_orange()
+ggsave("plots/races_per_year.png", width = 8, height = 5, dpi = 300)
+
+# ---- Plot 3: Fastest Lap Distribution ----
+ggplot(lap_summary, aes(x = fastest_lap, fill = as.factor(driver_number))) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = orange_pal) +
+  labs(title = "Distribution of Fastest Laps (2022–2024)",
+       x = "Fastest Lap Time (s)",
+       y = "Count",
+       fill = "Driver #") +
+  theme_orange()
+ggsave("plots/fastest_lap_distribution.png", width = 10, height = 6, dpi = 300)
+
+cat("✅ All plots generated successfully in 'plots/' folder.\n")
+```
